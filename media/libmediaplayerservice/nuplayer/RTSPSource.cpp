@@ -30,6 +30,7 @@
 namespace android {
 
 const int64_t kNearEOSTimeoutUs = 2000000ll; // 2 secs
+const uint32_t kMaxNumKeepDamagedAccessUnits = 30;
 
 NuPlayer::RTSPSource::RTSPSource(
         const sp<AMessage> &notify,
@@ -48,9 +49,12 @@ NuPlayer::RTSPSource::RTSPSource(
       mFinalResult(OK),
       mDisconnectReplyID(0),
       mBuffering(true),
+      mIsH263(false),
+      mNumKeepDamagedAccessUnits(0),
       mSeekGeneration(0),
       mEOSTimeoutAudio(0),
-      mEOSTimeoutVideo(0) {
+      mEOSTimeoutVideo(0),
+      mSeekDoneNotify(NULL) {
     if (headers) {
         mExtraHeaders = *headers;
 
@@ -130,6 +134,8 @@ void NuPlayer::RTSPSource::pause() {
 
         // Check if EOS or ERROR is received
         if (source != NULL && source->isFinished(mediaDurationUs)) {
+            ALOGI("Nearing EOS...No Pause is issued");
+            mHandler->setAUTimeoutCheck(false);
             return;
         }
     }
@@ -317,6 +323,23 @@ void NuPlayer::RTSPSource::performSeek(int64_t seekTimeUs) {
 
     mState = SEEKING;
     mHandler->seek(seekTimeUs);
+
+    // After seek, the previous packets in the source are obsolete, so clear them
+    for (size_t index = 0; index < mTracks.size(); index++) {
+        TrackInfo *info = &mTracks.editItemAt(index);
+        sp<AnotherPacketSource> source = info->mSource;
+        if (source != NULL) {
+            source->queueDiscontinuity(ATSParser::DISCONTINUITY_SEEK, NULL);
+        }
+    }
+}
+
+int32_t NuPlayer::RTSPSource::getServerTimeoutMs() {
+    if (mHandler != NULL) {
+        return mHandler->getServerTimeoutMs();
+    } else {
+        return 0;
+    }
 }
 
 void NuPlayer::RTSPSource::onMessageReceived(const sp<AMessage> &msg) {
@@ -378,11 +401,19 @@ void NuPlayer::RTSPSource::onMessageReceived(const sp<AMessage> &msg) {
         case MyHandler::kWhatSeekDone:
         {
             mState = CONNECTED;
+            if (mSeekDoneNotify != NULL) {
+                mSeekDoneNotify->post();
+                mSeekDoneNotify = NULL;
+            }
             break;
         }
 
         case MyHandler::kWhatAccessUnit:
         {
+            // While seeking, stop queueing the units which are already obsolete to the source
+            if (mState == SEEKING) {
+                break;
+            }
             size_t trackIndex;
             CHECK(msg->findSize("trackIndex", &trackIndex));
 
@@ -398,8 +429,15 @@ void NuPlayer::RTSPSource::onMessageReceived(const sp<AMessage> &msg) {
             int32_t damaged;
             if (accessUnit->meta()->findInt32("damaged", &damaged)
                     && damaged) {
-                ALOGI("dropping damaged access unit.");
-                break;
+                if (mIsH263 && mNumKeepDamagedAccessUnits < kMaxNumKeepDamagedAccessUnits) {
+                    ALOGI("keep a damaged  access unit");
+                    ++mNumKeepDamagedAccessUnits;
+                } else {
+                    ALOGI("dropping damaged access unit.");
+                    break;
+                }
+            } else {
+                mNumKeepDamagedAccessUnits = 0;
             }
 
             if (mTSParser != NULL) {
@@ -559,6 +597,10 @@ void NuPlayer::RTSPSource::onConnected() {
             return;
         }
 
+        if (!strcasecmp(mime, MEDIA_MIMETYPE_VIDEO_H263)) {
+            mIsH263 = true;
+        }
+
         bool isAudio = !strncasecmp(mime, "audio/", 6);
         bool isVideo = !strncasecmp(mime, "video/", 6);
 
@@ -671,6 +713,11 @@ void NuPlayer::RTSPSource::finishDisconnectIfPossible() {
 
     (new AMessage)->postReply(mDisconnectReplyID);
     mDisconnectReplyID = 0;
+}
+
+bool NuPlayer::RTSPSource::setCbfForSeekDone(const sp<AMessage> &notify) {
+    mSeekDoneNotify = notify;
+    return true;
 }
 
 }  // namespace android
